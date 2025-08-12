@@ -1,0 +1,4 @@
+name = "BasePlateFEA"
+uuid = "c71acda9-9915-479f-b4cc-983bf6f08937"
+authors = ["Cris Moen <cris.moen@runtosolve.com>"]
+version = "0.1.0"
