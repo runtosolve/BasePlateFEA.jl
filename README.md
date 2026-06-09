@@ -35,7 +35,7 @@ Converted from MATLAB (S. Adany, 2026).
 
 ## Overview
 
-OneRack models a **C-section cold-formed steel column** bolted to a **steel base plate**, which rests on a rigid foundation. The model captures:
+Models a **C-section cold-formed steel column** bolted to a **steel base plate**, which rests on a rigid foundation. The model captures:
 
 - Thin-walled shell behaviour (membrane + bending) using Mindlin plate theory
 - Bolt hole geometry approximated as polygons
@@ -55,7 +55,7 @@ julia files/
 ├── README.md             # This file
 │
 ├── src/
-│   ├── OneRack.jl        # Main module — imports all source files
+│   ├── BasePlateFEA.jl        # Main module — imports all source files
 │   ├── types.jl          # Struct definitions shared across the package
 │   │
 │   │── Cross-section
