@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "766355104ce0ca7b042e6afeaa17e25251c1564c"
+project_hash = "b08f8f7d8acd11360909ba6c4bc1b07957a906fc"
 
 [[deps.ArgTools]]
 uuid = "0dad84c5-d112-42e6-8d28-ef12dabb789f"
@@ -18,7 +18,7 @@ version = "1.11.0"
 
 [[deps.BasePlateFEA]]
 deps = ["GeometryBasics", "LinearAlgebra", "Random", "SparseArrays", "Statistics"]
-path = "."
+path = "/Users/crismoen/.julia/dev/BasePlateFEA"
 uuid = "c71acda9-9915-479f-b4cc-983bf6f08937"
 version = "0.1.0"
 
