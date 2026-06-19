@@ -8,7 +8,7 @@ using SparseArrays
 # ─────────────────────────────────────────────────────────────────────────────
 dpn = 6
 calcmodenr = 20
-stressout = 1
+stressout = 0
 
 # tolerances (kip-inch units after conversion)
 tolers = BasePlateFEA.Tolerances(
@@ -173,25 +173,33 @@ nodes, el_nodes, el_props, nodenr, pl_el_edges, pl_edge_nodes =
     BasePlateFEA.main_modelgen(PLATE_table, LOAD_table, SUPPORT_table, CONDSUP_table, HOLE_table,
                   FE_dat, fe_size, mesh_typ, rat_q2t, tolers)
 
-d_ini = Float64[]; lv = Float64[]; Ke = spzeros(0, 0)
+d_act = Float64[]; lv = Float64[]; Ke = spzeros(0, 0); Ke_cond = spzeros(0, 0);
 
 
 
 
 # incremental load steps
 # lf = vcat(collect(0.000:0.001:0.005), collect(0.01:0.01:0.05), collect(0.1:0.1:1.0))
-lf = collect(0.000:0.001:0.004)
+# lf = collect(0.000:0.001:0.004)
+lf = [0, 0.001, 0.002, 0.005, 0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1]
 dincr = diff(lf)
 nincr = length(dincr)
 dmami = zeros(nincr+1, 2)
+d_act=zeros(nodenr*dpn)
 
 for iincr in 1:nincr
-    global d_ini, Ke, lv
-    d_stat, Ke, lv = BasePlateFEA.FEanal_incr(iincr, dincr, d_ini, Ke, lv,
+#    global d_ini, Ke, lv
+#    d_stat, Ke, lv = BasePlateFEA.FEanal_incr(iincr, dincr, d_ini, Ke, lv,
+#                                   nodes, el_nodes, el_props, pl_el_edges, pl_edge_nodes,
+#                                   nodenr, PLATE_table, MAT_table, SUPPORT_table,
+#                                   CONDSUP_table, LOAD_table, FE_dat, mat_sym, dpn, tolers)
+#    d_ini = d_stat   # keep at nodenr*dpn for next FEanal_incr call
+
+   global d_act, Ke, Ke_cond, lv
+   d_act, Ke, Ke_cond, lv = BasePlateFEA.FEanal_incr(iincr, dincr, d_act, Ke, Ke_cond, lv,
                                    nodes, el_nodes, el_props, pl_el_edges, pl_edge_nodes,
                                    nodenr, PLATE_table, MAT_table, SUPPORT_table,
                                    CONDSUP_table, LOAD_table, FE_dat, mat_sym, dpn, tolers)
-    d_ini = d_stat   # keep at nodenr*dpn for next FEanal_incr call
 
     # re-index to all-node DOF space for post-processing
     ind = Int.(nodes[:, 5]) .- 1
@@ -200,7 +208,7 @@ for iincr in 1:nincr
     for i in 1:dpn
         ind2[i:dpn:ndof_full] = ind .* dpn .+ i
     end
-    d_stat = d_stat[ind2]   # now total_nodes*dpn (for dmami, visualization)
+    d_stat = d_act[ind2]   # now total_nodes*dpn (for dmami, visualization)
 
     ind_bp = findall(j -> abs(nodes[j, 3]) < 0.001, 1:size(nodes, 1))
     dmami[iincr+1, 1] = minimum(d_stat[(ind_bp .- 1) .* dpn .+ 3])
@@ -238,26 +246,28 @@ end
 # # ─────────────────────────────────────────────────────────────────────────────
 # # FORCE-DISPLACEMENT CURVE
 # # ─────────────────────────────────────────────────────────────────────────────
-# zerodist = tolers.zero_dist
-# if abs(M2) > 0.00001
-#     nod_b1 = findall(j -> abs(nodes[j,3]) < zerodist &&
-#                      nodes[j,1] > Dc+yCG-fe_size[1] && nodes[j,1] < Dc+yCG+fe_size[1] &&
-#                      abs(nodes[j,2] - (W/2 - h/2)) < zerodist && nodes[j,4] > 0,
-#                      1:size(nodes,1))
-#     nod_b2 = findall(j -> abs(nodes[j,3]) < zerodist &&
-#                      nodes[j,1] > Dc+yCG-fe_size[1] && nodes[j,1] < Dc+yCG+fe_size[1] &&
-#                      abs(nodes[j,2] - (W/2 + h/2)) < zerodist && nodes[j,4] > 0,
-#                      1:size(nodes,1))
-#     if !isempty(nod_b1) && !isempty(nod_b2)
-#         act_b1 = Int.(nodes[nod_b1, 5])
-#         act_b2 = Int.(nodes[nod_b2, 5])
-#         ave_d_b1 = mean(d_ini[(act_b1 .- 1) .* dpn .+ 3])
-#         ave_d_b2 = mean(d_ini[(act_b2 .- 1) .* dpn .+ 3])
-#         rot  = (ave_d_b2 - ave_d_b1) / h
-#         stif2 = abs(M2) / abs(rot)
-#         println("Rotational stiffness = $stif2 kip-in/rad")
-#     end
-# end
+zerodist = tolers.zero_dist
+if abs(M2) > 0.00001
+    nod_b1 = findall(j -> abs(nodes[j,3]) < zerodist &&
+                     nodes[j,1] > Dc+yCG-fe_size[1] && nodes[j,1] < Dc+yCG+fe_size[1] &&
+                     abs(nodes[j,2] - (W/2 - h/2)) < zerodist && nodes[j,4] > 0,
+                     1:size(nodes,1))
+    nod_b2 = findall(j -> abs(nodes[j,3]) < zerodist &&
+                     nodes[j,1] > Dc+yCG-fe_size[1] && nodes[j,1] < Dc+yCG+fe_size[1] &&
+                     abs(nodes[j,2] - (W/2 + h/2)) < zerodist && nodes[j,4] > 0,
+                     1:size(nodes,1))
+    if !isempty(nod_b1) && !isempty(nod_b2)
+        act_b1 = Int.(nodes[nod_b1, 5])
+        act_b2 = Int.(nodes[nod_b2, 5])
+        dof_b1 = (d_act[(act_b1 .- 1) .* dpn .+ 3])
+        dof_b2 = (d_act[(act_b2 .- 1) .* dpn .+ 3])
+        ave_d_b1=sum(dof_b1)/size(dof_b1,1)
+        ave_d_b2=sum(dof_b2)/size(dof_b2,1)
+        rot  = (ave_d_b2 - ave_d_b1) / h
+        stif2 = abs(M2) / abs(rot)
+        println("Rotational stiffness = $stif2 kip-in/rad")
+    end
+end
 
 # nod_bp = findall(j -> abs(nodes[j, 3]) < zerodist, 1:size(nodes, 1))
 # act_bp = Int.(nodes[nod_bp, 5])

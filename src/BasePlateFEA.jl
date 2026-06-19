@@ -2124,8 +2124,64 @@ ANALYSIS
 #########################################
 """
 
+function FEanal_incr(iincr, dincr, d_act, Ke, Ke_cond, lv, nodes, el_nodes, el_props,
+                     pl_el_edges, pl_edge_nodes, nodenr,
+                     PLATE_table, MAT_table, SUPPORT_table, CONDSUP_table, LOAD_table,
+                     FE_dat, mat_sym, dpn, tolers)
+    if iincr == 1
+        println("Stiffness matrix calculation ")
+        t0 = time()
+        Ke = stiffmat_e(nodes, el_nodes, el_props, nodenr, MAT_table, FE_dat, mat_sym, dpn)
+         println("  done in $(round(time()-t0, digits=2)) s")
 
-function FEanal_incr(iincr, dincr, d_ini, Ke, lv, nodes, el_nodes, el_props,
+        println("Adding supports ")
+        t0 = time()
+        Ke_sup = fem_support(Ke, PLATE_table, SUPPORT_table, FE_dat, nodes, el_nodes, el_props, nodenr, dpn, tolers)
+        Ke = Ke + Ke_sup
+        println("  done in $(round(time()-t0, digits=2)) s")
+
+        println("Load vector ")
+        t0 = time()
+     #   lv = load_vec_UDL(nodes, el_nodes, el_props, nodenr, PLATE_table, LOAD_table, FE_dat, dpn)
+     #   lv .+= load_vec_edge(nodes, el_nodes, el_props, pl_el_edges, pl_edge_nodes, nodenr, PLATE_table, LOAD_table, FE_dat, dpn, tolers)
+     #   lv .+= load_vec_point(nodes, nodenr, PLATE_table, LOAD_table, dpn, tolers)
+        lv = load_vec_edge(nodes, el_nodes, el_props, pl_el_edges, pl_edge_nodes, nodenr, PLATE_table, LOAD_table, FE_dat, dpn, tolers)
+        println("  done in $(round(time()-t0, digits=2)) s")
+    end
+
+    println("Load increment $iincr")
+    t0 = time()
+    dlv = lv * dincr[iincr]
+    df = dlv
+    lv_act=lv*sum(dincr[1:iincr])
+    uncond=false
+
+    err1=1; err2=1; err_tol=0.001;
+    iter=0; 
+    while err1>err_tol || err2>err_tol*1000
+        iter=iter+1;
+        if iincr==1 && iter==1; uncond=true; end
+        if iter==1
+            Ke_cond = cond_support(Ke, PLATE_table, CONDSUP_table, FE_dat, nodes, el_nodes, el_props, nodenr, d_act, dpn, uncond, tolers)
+            uncond=false
+        end
+        d_incr = Symmetric(Ke + Ke_cond) \ Array(df)
+        d_act=d_act+d_incr
+        Ke_cond = cond_support(Ke, PLATE_table, CONDSUP_table, FE_dat, nodes, el_nodes, el_props, nodenr, d_act, dpn, uncond, tolers)
+        f_act=Symmetric(Ke+Ke_cond)*d_act
+        df=lv_act-f_act*(0.95)
+        normdf=norm(df)
+        err2=normdf/norm(dlv)
+        err1=normdf/norm(lv)
+     end
+    println("  done in $(round(time()-t0, digits=2)) s")
+ 
+    return d_act, Ke, Ke_cond, lv
+end
+
+
+
+function FEanal_incr_old(iincr, dincr, d_ini, Ke, lv, nodes, el_nodes, el_props,
                      pl_el_edges, pl_edge_nodes, nodenr,
                      PLATE_table, MAT_table, SUPPORT_table, CONDSUP_table, LOAD_table,
                      FE_dat, mat_sym, dpn, tolers)
