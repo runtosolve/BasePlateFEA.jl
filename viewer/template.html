@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Base Plate Viewer</title>
+<style>
+:root {
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --s1: #2a78d6; --s2: #eb6834; --neutral: #f0efec; --scene: #eeeeea;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --s1: #3987e5; --s2: #d95926; --neutral: #383835; --scene: #141413;
+  }
+}
+:root[data-theme="dark"] {
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --s1: #3987e5; --s2: #d95926; --neutral: #383835; --scene: #141413;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--page); color: var(--ink); font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+#app { display: grid; grid-template-columns: minmax(0, 1fr) 400px; grid-template-rows: auto minmax(0, 1fr); height: 100vh; }
+header { grid-column: 1 / -1; padding: 10px 16px; border-bottom: 1px solid var(--grid); display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; }
+header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+header span { color: var(--ink2); }
+#scene { position: relative; background: var(--scene); min-height: 320px; }
+#scene canvas { display: block; width: 100%; height: 100%; }
+#legend { position: absolute; left: 16px; bottom: 16px; background: var(--surface); border: 1px solid var(--grid); border-radius: 6px; padding: 8px 10px; }
+#legend .bar { width: 220px; height: 12px; border-radius: 3px; }
+#legend .ticks { display: flex; justify-content: space-between; color: var(--ink2); font-variant-numeric: tabular-nums; margin-top: 2px; }
+#legend .name { font-weight: 600; margin-bottom: 4px; }
+#readout { position: absolute; left: 16px; top: 12px; color: var(--ink2); font-variant-numeric: tabular-nums; background: var(--surface); border: 1px solid var(--grid); border-radius: 6px; padding: 6px 10px; }
+#readout b { color: var(--ink); font-weight: 600; }
+#side { overflow-y: auto; border-left: 1px solid var(--grid); background: var(--surface); padding: 12px 16px; }
+.ctl { display: grid; grid-template-columns: 110px 1fr; gap: 6px 8px; align-items: center; margin-bottom: 10px; }
+.ctl label { color: var(--ink2); }
+select, input[type=number], button { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--axis); border-radius: 4px; padding: 3px 6px; }
+button { cursor: pointer; }
+input[type=range] { width: 100%; accent-color: var(--s1); }
+.row { display: flex; gap: 8px; align-items: center; }
+.checks { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; color: var(--ink2); }
+h2 { font-size: 13px; margin: 14px 0 2px; font-weight: 600; }
+.sub { color: var(--ink2); margin-bottom: 4px; }
+svg text { fill: var(--muted); font-size: 11px; }
+svg .lab { fill: var(--ink2); }
+.key { display: flex; gap: 14px; flex-wrap: wrap; color: var(--ink2); margin: 2px 0 6px; }
+.key i { display: inline-block; width: 18px; height: 0; border-top: 2px solid; vertical-align: middle; margin-right: 5px; }
+#tip { position: fixed; pointer-events: none; background: var(--surface); border: 1px solid var(--axis); border-radius: 4px; padding: 4px 8px; display: none; font-variant-numeric: tabular-nums; z-index: 5; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+td, th { text-align: right; padding: 2px 6px; border-bottom: 1px solid var(--grid); }
+th { color: var(--ink2); font-weight: 500; }
+details { margin-top: 10px; } summary { cursor: pointer; color: var(--ink2); }
+@media (max-width: 900px) { #app { grid-template-columns: 1fr; grid-template-rows: auto 55vh auto; height: auto; } #side { border-left: 0; border-top: 1px solid var(--grid); } }
+</style>
+</head>
+<body>
+<div id="app">
+  <header><h1 id="title"></h1><span id="subtitle"></span></header>
+  <div id="scene">
+    <div id="readout"></div>
+    <div id="legend"><div class="name" id="lgname"></div><div class="bar" id="lgbar"></div><div class="ticks" id="lgticks"></div></div>
+  </div>
+  <div id="side">
+    <div class="ctl">
+      <label for="field">Contour</label><select id="field"></select>
+      <label for="frame">Load step</label><div class="row"><input type="range" id="frame" min="0" value="0"><button id="play" title="Animate">Play</button></div>
+      <label for="scale">Deformation ×</label><input type="number" id="scale" min="0" step="1" value="1">
+      <label for="cmax">Contour max</label><div class="row"><input type="number" id="cmax" step="any" style="width:90px"><button id="cauto">Auto</button></div>
+    </div>
+    <div class="checks">
+      <label><input type="checkbox" id="showUp" checked> Upright</label>
+      <label><input type="checkbox" id="showEdges"> Mesh</label>
+      <label><input type="checkbox" id="showBolts" checked> Bolt forces</label>
+    </div>
+    <h2>Moment – rotation</h2>
+    <div class="sub">Base moment (kip-in) vs. rotation (rad). Click the curve to jump to a load step.</div>
+    <div class="key" id="mrkey"></div>
+    <svg id="mr" width="368" height="250"></svg>
+    <h2>Axial force – shortening</h2>
+    <div class="sub">Axial compression (kip) vs. downward displacement of the measurement points (in).</div>
+    <svg id="nd" width="368" height="190"></svg>
+    <details><summary>Load step table</summary><table id="tbl"></table></details>
+  </div>
+</div>
+<div id="tip"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+const D = /*DATA*/null;
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+$('title').textContent = D.title; $('subtitle').textContent = D.subtitle;
+
+// ---------- colour scales: sequential = one hue light→dark, diverging = two hues + neutral midpoint
+const SEQ = ['#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#184f95', '#0d366b'];
+const hex = h => [parseInt(h.slice(1, 3), 16) / 255, parseInt(h.slice(3, 5), 16) / 255, parseInt(h.slice(5, 7), 16) / 255];
+function ramp(stops, t) {
+  t = Math.min(1, Math.max(0, t)) * (stops.length - 1);
+  const i = Math.min(stops.length - 2, Math.floor(t)), f = t - i, a = stops[i], b = stops[i + 1];
+  return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+}
+const seqStops = SEQ.map(hex);
+const divStops = () => [hex('#104281'), hex('#3987e5'), hex(css('--neutral')), hex('#eb6834'), hex('#9a3a12')];
+const NAN_COLOR = () => hex(css('--neutral'));
+
+// ---------- fields
+const FIELDS = [
+  { key: 'vm_top', name: 'von Mises stress, top surface (ksi)', kind: 'seq', src: 'elem' },
+  { key: 'vm_bot', name: 'von Mises stress, bottom surface (ksi)', kind: 'seq', src: 'elem' },
+  { key: 'vm_mid', name: 'von Mises stress, mid-surface (ksi)', kind: 'seq', src: 'elem' },
+  { key: 'peeq', name: 'Equivalent plastic strain', kind: 'seq', src: 'elem' },
+  { key: 'contact', name: 'Contact stress on the plate (ksi)', kind: 'seq', src: 'bp' },
+  { key: 'sx', name: 'Membrane stress σx (ksi)', kind: 'div', src: 'elem' },
+  { key: 'sy', name: 'Membrane stress σy (ksi)', kind: 'div', src: 'elem' },
+  { key: 'sx_top', name: 'Top surface stress σx (ksi)', kind: 'div', src: 'elem' },
+  { key: 'sy_top', name: 'Top surface stress σy (ksi)', kind: 'div', src: 'elem' },
+  { key: 'uz', name: 'Vertical displacement (in)', kind: 'div', src: 'node' },
+].filter(f => f.src !== 'elem' || D.frames[0].fields[f.key]);
+FIELDS.forEach((f, i) => $('field').add(new Option(f.name, i)));
+
+// ---------- three.js scene (z up)
+const sceneEl = $('scene');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+const setClear = () => renderer.setClearColor(new THREE.Color(css('--scene')), 1); setClear();
+sceneEl.insertBefore(renderer.domElement, sceneEl.firstChild);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(35, 1, 0.01, 1000);
+camera.up.set(0, 0, 1);
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+
+const nn = D.nodes.length / 3, tris = D.tris, ntri = tris.length / 3;
+const bpIndex = new Int32Array(nn).fill(-1);
+D.bp_nodes.forEach((n, i) => bpIndex[n] = i);
+function makeMesh(sel) {
+  const ids = []; for (let k = 0; k < ntri; k++) if (sel(D.tri_part[k])) ids.push(k);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(ids.length * 9), 3));
+  g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(ids.length * 9), 3));
+  const mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }));
+  mesh.userData.ids = ids; scene.add(mesh); return mesh;
+}
+const plate = makeMesh(p => p === 1), upright = makeMesh(p => p !== 1);
+const edgeGeo = new THREE.BufferGeometry();
+edgeGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(D.edges.length * 3), 3));
+const edges = new THREE.LineSegments(edgeGeo, new THREE.LineBasicMaterial({ color: 0x898781, transparent: true, opacity: 0.6 }));
+edges.visible = false; scene.add(edges);
+const boltGroup = new THREE.Group(); scene.add(boltGroup);
+
+let cur = 0, fieldIdx = 0, scaleU = 1, userMax = null;
+const pos = new Float32Array(nn * 3);
+function fieldRange(f) {
+  let mx = 0;
+  for (const fr of D.frames) {
+    const v = f.src === 'elem' ? fr.fields[f.key] : f.src === 'bp' ? fr.contact : null;
+    if (v) { for (const x of v) if (x !== null && Math.abs(x) > mx) mx = Math.abs(x); }
+    else for (let i = 2; i < fr.u.length; i += 3) if (Math.abs(fr.u[i]) > mx) mx = Math.abs(fr.u[i]);
+  }
+  return mx || 1;
+}
+function update() {
+  const fr = D.frames[cur], f = FIELDS[fieldIdx];
+  for (let i = 0; i < nn * 3; i++) pos[i] = D.nodes[i] + scaleU * fr.u[i];
+  const cmax = userMax || fieldRange(f);
+  const stops = f.kind === 'seq' ? seqStops : divStops(), nanc = NAN_COLOR();
+  const colorOf = v => v === null || v === undefined ? nanc : f.kind === 'seq' ? ramp(stops, Math.abs(v) / cmax) : ramp(stops, 0.5 + 0.5 * v / cmax);
+  for (const mesh of [plate, upright]) {
+    const P = mesh.geometry.attributes.position.array, C = mesh.geometry.attributes.color.array;
+    mesh.userData.ids.forEach((k, j) => {
+      const ec = f.src === 'elem' ? colorOf(fr.fields[f.key][D.tri_elem[k]]) : null;
+      for (let a = 0; a < 3; a++) {
+        const n = tris[3 * k + a], o = 9 * j + 3 * a;
+        P[o] = pos[3 * n]; P[o + 1] = pos[3 * n + 1]; P[o + 2] = pos[3 * n + 2];
+        let c = ec;
+        if (f.src === 'node') c = colorOf(fr.u[3 * n + 2]);
+        else if (f.src === 'bp') c = mesh === plate && bpIndex[n] >= 0 ? colorOf(fr.contact[bpIndex[n]]) : nanc;
+        C[o] = c[0]; C[o + 1] = c[1]; C[o + 2] = c[2];
+      }
+    });
+    mesh.geometry.attributes.position.needsUpdate = true; mesh.geometry.attributes.color.needsUpdate = true;
+    mesh.geometry.computeBoundingSphere();
+  }
+  upright.material.transparent = f.src === 'bp'; upright.material.opacity = f.src === 'bp' ? 0.25 : 1; upright.material.needsUpdate = true;
+  const E = edgeGeo.attributes.position.array;
+  D.edges.forEach((n, i) => { E[3 * i] = pos[3 * n]; E[3 * i + 1] = pos[3 * n + 1]; E[3 * i + 2] = pos[3 * n + 2]; });
+  edgeGeo.attributes.position.needsUpdate = true;
+  // bolt force arrows (length proportional to the force)
+  while (boltGroup.children.length) boltGroup.remove(boltGroup.children[0]);
+  const bmax = Math.max(1e-9, ...D.frames.map(q => Math.max(...q.bolt)));
+  D.bolt_nodes.forEach((n, i) => {
+    if (fr.bolt[i] <= 0) return;
+    const o = new THREE.Vector3(pos[3 * n], pos[3 * n + 1], pos[3 * n + 2]);
+    boltGroup.add(new THREE.ArrowHelper(new THREE.Vector3(0, 0, -1), o.clone().add(new THREE.Vector3(0, 0, 0.02)), 0.25 * D.size * fr.bolt[i] / bmax + 0.02, 0xeb6834, 0.08 * D.size * 0.5, 0.05 * D.size * 0.5));
+  });
+  // legend and readout
+  $('lgname').textContent = f.name;
+  const cssStops = (f.kind === 'seq' ? SEQ : ['#104281', '#3987e5', css('--neutral'), '#eb6834', '#9a3a12']).join(',');
+  $('lgbar').style.background = `linear-gradient(90deg, ${cssStops})`;
+  const fmt = x => Math.abs(x) >= 100 ? x.toFixed(0) : Math.abs(x) >= 1 ? x.toFixed(1) : x.toPrecision(2);
+  $('lgticks').innerHTML = f.kind === 'seq' ? `<span>0</span><span>${fmt(cmax / 2)}</span><span>${fmt(cmax)}</span>` : `<span>${fmt(-cmax)}</span><span>0</span><span>${fmt(cmax)}</span>`;
+  $('cmax').placeholder = fmt(fieldRange(f));
+  $('readout').innerHTML = `Step ${cur} of ${D.frames.length - 1} · N = <b>${fr.N.toFixed(2)}</b> kip · M = <b>${fr.M.toFixed(2)}</b> kip-in · θ = <b>${fr.theta.toFixed(5)}</b> rad<br>` +
+    `Bolt tension ${fr.bolt.map(b => b.toFixed(2)).join(' / ')} kip · peak contact stress ${Math.max(...fr.contact).toFixed(1)} ksi`;
+  drawCharts();
+}
+function resize() {
+  const w = sceneEl.clientWidth, h = sceneEl.clientHeight;
+  renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+(function initCamera() {
+  const c = D.center; controls.target.set(c[0], c[1], c[2]);
+  camera.position.set(c[0] + 1.6 * D.size, c[1] - 2.0 * D.size, c[2] + 1.5 * D.size);
+  controls.update();
+})();
+(function loop() { requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
+window.addEventListener('resize', resize);
+
+// ---------- charts
+const mrSeries = [{ label: 'BasePlateFEA', kind: 'fe', x: D.mr.theta, y: D.mr.M }].concat(D.curves);
+const STYLE = { fe: ['--s1', 2, ''], test: ['--muted', 1.2, ''], reference: ['--s2', 1.6, '5 3'] };
+(function key() {
+  const seen = {};
+  mrSeries.forEach(s => { const k = s.kind === 'test' ? 'Tests' : s.label; if (seen[k]) return; seen[k] = 1;
+    const st = STYLE[s.kind]; $('mrkey').insertAdjacentHTML('beforeend', `<span><i style="border-color:var(${st[0]});border-top-style:${st[2] ? 'dashed' : 'solid'}"></i>${k}</span>`); });
+})();
+function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(v))); const m = v / p; return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 5 ? 5 : 10) * p; }
+function chart(svg, series, marker, xlab, ylab, onPick) {
+  const W = +svg.getAttribute('width'), H = +svg.getAttribute('height'), m = { l: 44, r: 22, t: 8, b: 30 };
+  const fe = series[0];
+  let xm = niceMax(Math.max(1e-12, ...fe.x) * 1.05), ym = niceMax(Math.max(1e-12, ...series.flatMap(s => s.y)) * 1.02);
+  const X = v => m.l + (W - m.l - m.r) * v / xm, Y = v => H - m.b - (H - m.t - m.b) * v / ym;
+  let h = '';
+  for (let i = 0; i <= 4; i++) {
+    const gx = xm * i / 4, gy = ym * i / 4;
+    h += `<line x1="${X(0)}" x2="${X(xm)}" y1="${Y(gy)}" y2="${Y(gy)}" stroke="var(${i ? '--grid' : '--axis'})"/>`;
+    h += `<text x="${X(0) - 6}" y="${Y(gy) + 4}" text-anchor="end">${+gy.toPrecision(3)}</text><text x="${X(gx)}" y="${H - m.b + 14}" text-anchor="middle">${+gx.toPrecision(3)}</text>`;
+  }
+  h += `<text class="lab" x="${X(xm)}" y="${H - 2}" text-anchor="end">${xlab}</text>`;
+  h += `<clipPath id="c${svg.id}"><rect x="${X(0)}" y="${m.t}" width="${X(xm) - X(0)}" height="${Y(0) - m.t}"/></clipPath>`;
+  series.slice().reverse().forEach(s => { const st = STYLE[s.kind];
+    h += `<polyline clip-path="url(#c${svg.id})" fill="none" stroke="var(${st[0]})" stroke-width="${st[1]}" stroke-dasharray="${st[2]}" stroke-linejoin="round" points="${s.x.map((x, i) => X(x).toFixed(1) + ',' + Y(s.y[i]).toFixed(1)).join(' ')}"/>`; });
+  if (marker) h += `<circle cx="${X(marker[0])}" cy="${Y(marker[1])}" r="5" fill="var(--s1)" stroke="var(--surface)" stroke-width="2"/>`;
+  svg.innerHTML = h;
+  svg.onmousemove = e => {
+    const r = svg.getBoundingClientRect(), px = e.clientX - r.left; let best = 0, bd = 1e9;
+    fe.x.forEach((x, i) => { const d = Math.abs(X(x) - px); if (d < bd) { bd = d; best = i; } });
+    const t = $('tip'); t.style.display = 'block'; t.style.left = e.clientX + 12 + 'px'; t.style.top = e.clientY + 12 + 'px';
+    t.textContent = `${xlab.split(' ')[0]} ${(+fe.x[best].toPrecision(4))}, ${ylab} ${(+fe.y[best].toPrecision(4))}`; svg.dataset.best = best;
+  };
+  svg.onmouseleave = () => $('tip').style.display = 'none';
+  svg.onclick = () => onPick(+svg.dataset.best);
+}
+function drawCharts() {
+  const fr = D.frames[cur];
+  chart($('mr'), mrSeries, fr.step === 2 ? [fr.theta, fr.M] : [mrSeries[0].x[0], 0], 'θ (rad)', 'M', i => setFrame(D.mr.frame[i]));
+  chart($('nd'), [{ kind: 'fe', x: D.nd.w, y: D.nd.N }], [-fr.w, fr.N], 'shortening (in)', 'N', i => setFrame(D.nd.frame[i]));
+}
+(function table() {
+  let h = '<tr><th>Step</th><th>N (kip)</th><th>M (kip-in)</th><th>θ (rad)</th><th>Bolts (kip)</th></tr>';
+  D.frames.forEach((f, i) => h += `<tr><td>${i}</td><td>${f.N.toFixed(2)}</td><td>${f.M.toFixed(2)}</td><td>${f.theta.toFixed(5)}</td><td>${f.bolt.map(b => b.toFixed(2)).join(' / ')}</td></tr>`);
+  $('tbl').innerHTML = h;
+})();
+
+// ---------- controls
+function setFrame(i) { cur = Math.max(0, Math.min(D.frames.length - 1, i)); $('frame').value = cur; update(); }
+$('frame').max = D.frames.length - 1;
+$('frame').oninput = e => setFrame(+e.target.value);
+$('field').onchange = e => { fieldIdx = +e.target.value; userMax = null; $('cmax').value = ''; update(); };
+$('scale').value = scaleU = D.default_scale;
+$('scale').oninput = e => { scaleU = +e.target.value || 0; update(); };
+$('cmax').oninput = e => { userMax = +e.target.value > 0 ? +e.target.value : null; update(); };
+$('cauto').onclick = () => { userMax = null; $('cmax').value = ''; update(); };
+$('showUp').onchange = e => { upright.visible = e.target.checked; };
+$('showEdges').onchange = e => { edges.visible = e.target.checked; };
+$('showBolts').onchange = e => { boltGroup.visible = e.target.checked; };
+let timer = null;
+$('play').onclick = () => {
+  if (timer) { clearInterval(timer); timer = null; $('play').textContent = 'Play'; return; }
+  $('play').textContent = 'Pause'; if (cur >= D.frames.length - 1) setFrame(0);
+  timer = setInterval(() => { if (cur >= D.frames.length - 1) { $('play').click(); return; } setFrame(cur + 1); }, 160);
+};
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { setClear(); update(); });
+resize(); setFrame(D.frames.length - 1);
+</script>
+</body>
+</html>
