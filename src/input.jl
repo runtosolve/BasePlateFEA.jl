@@ -164,6 +164,7 @@ Materials
 - `plate_steel`, `upright_steel :: Steel` (elastic by default)
 - `Ec = 3410`, `νc = 0.2`: concrete half-space
 - `bolt_stiffness = 120` (kip/in), `bolt_yield = 3500` (kip), hardening to `2 fy` at `101 dy`
+- `bolt_law = nothing`: a `SpringLaw` for the anchors that replaces the three values above (for example a preloaded or slipping anchor)
 - `contact_stiffness = 5000` (ksi/in), `contact_yield = 50` (ksi), hardening to `11 fy`
 - `friction_stiffness = 0.1`, `hole_stiffness = 1.0` (kip/in per node, in-plane x and y)
 - `top_mpc = (A = 100, Iy = 1e4, Iz = 1e4, J = 1e2)`, `hole_mpc = (A = 1, Iy = 1, Iz = 1, J = 1)`:
@@ -202,6 +203,7 @@ Base.@kwdef struct BasePlateInput
     bolt_stiffness::Float64 = 120.0
     bolt_yield::Float64 = 3500.0
     bolt_hardening::Float64 = 2.0
+    bolt_law::Union{Nothing,SpringLaw} = nothing
     contact_stiffness::Float64 = 5000.0
     contact_yield::Float64 = 50.0
     contact_hardening::Float64 = 11.0

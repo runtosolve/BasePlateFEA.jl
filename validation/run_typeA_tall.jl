@@ -41,15 +41,22 @@ function thin(res, n = 45)
 end
 
 function main(outdir, N, tag, imp = 0.0, kb = 120.0, θmax = 0.08, typ = :A, max_steps = 400, pure = false)
-    inp = pure ? tall_input(typ; bolt_stiffness = kb, Ht = 1e9) : tall_input(typ; bolt_stiffness = kb)
+    # optional overrides: BPFEA_BOLT_FY (bolt yield, kip), BPFEA_BOLT_HARD (ultimate/yield), BPFEA_MODE (buckling mode used as imperfection)
+    extra = (; (haskey(ENV, "BPFEA_BOLT_FY") ? (; bolt_yield = parse(Float64, ENV["BPFEA_BOLT_FY"]), bolt_hardening = parse(Float64, get(ENV, "BPFEA_BOLT_HARD", "1.25"))) : (;))...)
+    if haskey(ENV, "BPFEA_BOLT_LAW")   # anchor law as "d1,f1;d2,f2;..." (in, kip) for the points after (0, 0)
+        pts = [parse.(Float64, split(p, ',')) for p in split(ENV["BPFEA_BOLT_LAW"], ';')]
+        extra = (; extra..., bolt_law = SpringLaw(vcat(-1000.0, 0.0, first.(pts)), vcat(0.0, 0.0, last.(pts))))
+    end
+    mode = parse(Int, get(ENV, "BPFEA_MODE", "1"))
+    inp = pure ? tall_input(typ; bolt_stiffness = kb, Ht = 1e9, extra...) : tall_input(typ; bolt_stiffness = kb, extra...)
     mesh = generate_mesh(inp)
     t0 = time()
     if imp != 0
-        λ, Φ = buckling_modes(Model(inp; mesh); N, M = 40.0, nmodes = 4)
+        λ, Φ = buckling_modes(Model(inp; mesh); N, M = 40.0, nmodes = max(4, mode))
         @printf("buckling load factors for N = %g kip, M = 40 kip-in: %s\n", N, string(round.(λ, digits = 3)))
-        mesh = apply_imperfection(mesh, Φ[:, 1], imp * inp.geometry.tu)
+        mesh = apply_imperfection(mesh, Φ[:, mode], imp * inp.geometry.tu)
     end
-    res = analyze(Model(inp; mesh); N, Mmax = 500.0, θmax, dM0 = 0.2, dM_max = 2.0, dθ_max = θmax / 80, max_steps)
+    res = analyze(Model(inp; mesh); N, Mmax = 500.0, θmax, dM0 = 0.2, dM_max = 2.0, dθ_max = θmax / 80, max_steps, trace_failures = get(ENV, "BPFEA_TRACE", "") == "1", control = Symbol(get(ENV, "BPFEA_CONTROL", "displacement")))
     name = "$(typ)_N$(loadtag(N))_$(tag)"
     save_curve(joinpath(outdir, name * ".csv"), res)
     serialize(joinpath(outdir, name * ".jls"), thin(res))

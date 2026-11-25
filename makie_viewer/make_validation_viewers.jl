@@ -15,6 +15,14 @@ function test_curves(vdir, typ, N)
     return cs
 end
 
+"every computed step from the run's CSV (the saved result may hold fewer frames)"
+function full_history(csv)
+    isfile(csv) || return nothing
+    hdr = split(readline(csv), ','); d = readdlm(csv, ',', Float64; skipstart = 1)
+    col(n) = d[:, findfirst(==(n), hdr)]
+    return (step = round.(Int, col("step")), N = col("N_kip"), M = col("M_kipin"), θ = col("rotation_rad"), w = col("w_in"))
+end
+
 function main(vdir, resdir, suffix, second_order = false, max_frames = 40)
     out = mkpath(joinpath(vdir, "viewers_makie"))
     for f in sort(readdir(resdir))
@@ -23,7 +31,8 @@ function main(vdir, resdir, suffix, second_order = false, max_frames = 40)
         typ = m[1]; N = parse(Float64, replace(m[2], "p" => "."))
         name = splitext(f)[1]; path = joinpath(out, name * ".html")
         res = deserialize(joinpath(resdir, f))
-        v = VizData(res; max_frames, second_order)
+        v = VizData(res; max_frames, second_order, history = full_history(joinpath(resdir, name * ".csv")),
+                    actuator_length = 1250 / 25.4)   # axial jack of the Barcelona rig, hinge to hinge, 1250 mm
         export_viewer(path, v; title = "Type $typ, N = $(m[2] |> x -> replace(x, "p" => ".")) kip",
                       subtitle = name, curves = test_curves(vdir, typ, N))
         println(name, ".html  ", round(filesize(path) / 1e6, digits = 1), " MB"); flush(stdout)

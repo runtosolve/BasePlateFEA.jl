@@ -35,7 +35,7 @@ function Model(inp::BasePlateInput; mesh::Mesh = generate_mesh(inp))
     area = inp.link_area == :average ? fill(sum(mesh.bp_area) / ncb, ncb) :
            inp.link_area == :tributary ? copy(mesh.bp_area) : throw(ArgumentError("link_area must be :average or :tributary"))
     return Model(inp, mesh, shell, K_const,
-                 elastic_hardening_spring(inp.bolt_stiffness, inp.bolt_yield, inp.bolt_hardening),
+                 inp.bolt_law === nothing ? elastic_hardening_spring(inp.bolt_stiffness, inp.bolt_yield, inp.bolt_hardening) : inp.bolt_law,
                  elastic_hardening_spring(inp.contact_stiffness, inp.contact_yield, inp.contact_hardening),
                  area, zeros(length(mesh.bolt_nodes)), zeros(ncb))
 end
@@ -196,17 +196,26 @@ end
 # Newton iteration on the residual f_int(u) − fext(λ); in displacement control the load factor is
 # an unknown and the constraint c·u = q closes the system (bordered solve with one factorization).
 function newton!(model::Model, u0, fext0, pattern, λ0; λ = nothing, q = nothing, c = nothing,
-                 rtol, atol, maxiter, uncond_first = false, verbose = false)
+                 rtol, atol, maxiter, uncond_first = false, verbose = false, linesearch = false)
     u = copy(u0)
     λk = λ === nothing ? λ0 : λ
     restore!(model.shell)
+    absK = abs.(model.K_const)
     for it in 1:maxiter
         f, K = internal_forces(model, u; uncond = uncond_first && it == 1)
         r = f .- fext0 .- λk .* pattern
         rn = norm(r)
         fref = max(norm(fext0 .+ λk .* pattern), norm(f), atol)
-        verbose && @printf("      it %2d  |r| = %.3e  λ = %.5g\n", it, rn, λk)
-        if it > 1 && rn <= rtol * fref && (q === nothing || abs(dot(c, u) - q) <= 1e-9 * max(abs(q), 1e-12))
+        # round-off floor of the residual: the rigid links are ~1e10 kip/in, so with large top
+        # displacements K u cancels to no better than ~eps |K||u|, which can exceed rtol * fref
+        tol = max(rtol * fref, 10 * eps() * norm(absK * abs.(u)))
+        if verbose
+            m = model.mesh
+            nc = count(i -> link_response(model, u, i)[2] != 0, eachindex(m.bp_nodes))
+            nb = count(i -> bolt_response(model, u, i)[2] != 0, eachindex(m.bolt_nodes))
+            @printf("      it %2d  |r|/fref = %.3e (tol %.1e)  λ = %.6g  contact links active = %d  bolts active = %d\n", it, rn / fref, tol / fref, λk, nc, nb)
+        end
+        if it > 1 && rn <= tol && (q === nothing || abs(dot(c, u) - q) <= 1e-9 * max(abs(q), 1e-12))
             return u, λk, it - 1, true
         end
         (isfinite(rn) && rn < 1e12 * fref) || break
@@ -217,8 +226,18 @@ function newton!(model::Model, u0, fext0, pattern, λ0; λ = nothing, q = nothin
             dr = F \ r
             dl = F \ pattern
             dλ = (q - dot(c, u) + dot(c, dr)) / dot(c, dl)
-            u .+= dλ .* dl .- dr
-            λk += dλ
+            du = dλ .* dl .- dr
+            α = 1.0
+            if linesearch && it > 1          # backtrack on the residual norm (the constraint already holds after iteration 1)
+                for _ in 1:6
+                    ft, _ = internal_forces(model, u .+ α .* du)
+                    norm(ft .- fext0 .- (λk + α * dλ) .* pattern) < (1 - 1e-4 * α) * rn && break
+                    α /= 2
+                end
+                verbose && α < 1 && @printf("        line search α = %.4f\n", α)
+            end
+            u .+= α .* du
+            λk += α * dλ
         end
     end
     return u, λk, maxiter, false
@@ -235,11 +254,18 @@ load pattern of `bp_Barcelona.m` (`V = M/Ht` at the master node at height `H` pl
 
 Keywords: `axial_increments = 5`, `dM0 = Mmax/100` (first moment increment), `dM_max = Mmax/20`,
 `dθ_max = θmax/40` (largest increments), `rtol = 1e-6` (residual force tolerance relative to the
-force level), `maxiter = 20`, `max_steps = 400`, `verbose = true`.
+force level; never tighter than the round-off of the residual), `maxiter = 20`, `max_steps = 400`, `verbose = true`, `trace_failures = false` (print the
+residual history of every increment that does not converge), `control = :displacement` (step 2 driven
+by the load-conjugate displacement of the master node) or `:arclength` (each increment is constrained
+to the plane normal to the previous displacement increment, which follows snap-back of the control
+displacement), `resume = nothing` (a `Result` of the same `model` to continue from its last frame),
+`linesearch = false` (backtracking on the residual norm in the step 2 iterations).
 """
 function analyze(model::Model; N::Real, Mmax::Real, θmax::Real = Inf, axial_increments::Int = 5,
                  dM0::Real = Mmax / 100, dM_max::Real = Mmax / 20, dθ_max::Real = θmax / 40,
-                 rtol::Real = 1e-6, atol::Real = 1e-9, maxiter::Int = 20, max_steps::Int = 400, verbose::Bool = true)
+                 rtol::Real = 1e-6, atol::Real = 1e-9, maxiter::Int = 20, max_steps::Int = 400, verbose::Bool = true, trace_failures::Bool = false,
+                 control::Symbol = :displacement, resume::Union{Nothing,Result} = nothing, linesearch::Bool = false)
+    control in (:displacement, :arclength) || throw(ArgumentError("control must be :displacement or :arclength"))
     m = model.mesh
     H, Ht, _ = rounded_heights(model.inp)
     n = ndofs(m)
@@ -248,21 +274,25 @@ function analyze(model::Model; N::Real, Mmax::Real, θmax::Real = Inf, axial_inc
     P1 = master_load(m, (0.0, 0.0, -float(N), 0.0, 0.0, 0.0))
     zero_load = zeros(n)
 
-    # ---- step 1: axial force, load control ----------------------------------------------
-    λ = 0.0; dλ = 1 / axial_increments; first = true
-    while λ < 1 - 1e-12
-        λt = min(λ + dλ, 1.0)
-        ut, _, it, ok = newton!(model, u, zero_load, P1, λt; λ = λt, rtol, atol, maxiter, uncond_first = first)
-        if !ok
-            dλ /= 4
-            dλ < 1e-6 && return Result(model, frames, :failed)
-            continue
+    if resume === nothing
+        # ---- step 1: axial force, load control ----------------------------------------------
+        λ = 0.0; dλ = 1 / axial_increments; first = true
+        while λ < 1 - 1e-12
+            λt = min(λ + dλ, 1.0)
+            ut, _, it, ok = newton!(model, u, zero_load, P1, λt; λ = λt, rtol, atol, maxiter, uncond_first = first)
+            if !ok
+                dλ /= 4
+                dλ < 1e-6 && return Result(model, frames, :failed)
+                continue
+            end
+            first = false
+            u = ut; λ = λt
+            commit!(model, u)
+            push!(frames, Frame(model, 1, λ * N, 0.0, it, u))
+            verbose && @printf("  axial   N = %7.3f  w = %10.3e  iterations = %d\n", λ * N, frames[end].w, it)
         end
-        first = false
-        u = ut; λ = λt
-        commit!(model, u)
-        push!(frames, Frame(model, 1, λ * N, 0.0, it, u))
-        verbose && @printf("  axial   N = %7.3f  w = %10.3e  iterations = %d\n", λ * N, frames[end].w, it)
+    else                                  # continue a stopped analysis of this model from its last frame
+        frames = copy(resume.frames); u = copy(frames[end].u)
     end
 
     # ---- step 2: moment, displacement control on q = c·u -----------------------------------
@@ -274,11 +304,18 @@ function analyze(model::Model; N::Real, Mmax::Real, θmax::Real = Inf, axial_inc
     restore!(model.shell)
     dq_dM = dot(c, factorize_tangent(K) \ P2)        # tangent compliance of the control displacement
     dq = dM0 * dq_dM
-    M = 0.0; θ = frames[end].θ; status = :max_steps
+    M = frames[end].M; θ = frames[end].θ; status = :max_steps
     nfail = 0
     for _ in 1:max_steps
-        ut, Mt, it, ok = newton!(model, u, P1, P2, M; q = q + dq, c, rtol, atol, maxiter)
-        if !ok
+        ut, Mt, it, ok = newton!(model, u, P1, P2, M; q = q + dq, c, rtol, atol, maxiter, linesearch)
+        # a "converged" state far from the last one is another solution, not the next point of the path
+        runaway = ok && isfinite(dθ_max) && abs(abs(rotation(model, ut)[1]) - θ) > 4 * dθ_max
+        if !ok || runaway
+            if trace_failures
+                @printf("    %s for dq = %.3e (M = %.4f, θ = %.6f); iteration history:\n", runaway ? "runaway step" : "no convergence", dq, M, θ)
+                newton!(model, u, P1, P2, M; q = q + dq, c, rtol, atol, maxiter, linesearch, verbose = true)
+            end
+            restore!(model.shell)
             dq /= 4; nfail += 1
             if nfail > 8
                 status = :failed
@@ -292,7 +329,12 @@ function analyze(model::Model; N::Real, Mmax::Real, θmax::Real = Inf, axial_inc
         push!(frames, fr)
         verbose && @printf("  moment  M = %8.3f  θ = %9.6f  iterations = %d\n", Mt, fr.θ, it)
         dM = Mt - M; dθ = fr.θ - θ
-        u = ut; q += dq; M = Mt; θ = fr.θ
+        step = dq
+        if control == :arclength             # next constraint plane: normal to the last increment
+            du = ut .- u; step = norm(du)
+            c = du ./ step
+        end
+        u = ut; q = dot(c, u); M = Mt; θ = fr.θ
         if M >= Mmax * (1 - 1e-9)
             status = :completed
             break
@@ -301,11 +343,10 @@ function analyze(model::Model; N::Real, Mmax::Real, θmax::Real = Inf, axial_inc
             break
         end
         # next increment: grow or shrink with the iteration count, limited in ΔM and Δθ
-        grow = it <= 5 ? 1.5 : it <= 10 ? 1.2 : it <= 15 ? 1.0 : 0.5
-        lim = Inf
-        dM > 0 && (lim = min(lim, dq * min(dM_max, Mmax - M + 1e-6 * Mmax) / dM))
-        (dθ > 0 && isfinite(dθ_max)) && (lim = min(lim, dq * dθ_max / dθ))
-        dq = min(dq * grow, lim)
+        g = it <= 5 ? 1.5 : it <= 10 ? 1.2 : it <= 15 ? 1.0 : 0.5
+        dM > 0 && (g = min(g, min(dM_max, Mmax - M + 1e-6 * Mmax) / dM))
+        (abs(dθ) > 0 && isfinite(dθ_max)) && (g = min(g, dθ_max / abs(dθ)))
+        dq = step * g
     end
     return Result(model, frames, status)
 end

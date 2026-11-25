@@ -21,6 +21,8 @@ export serve_viewer, export_viewer, render_image, viewer_app, VizData
 
 const NBANDS = 12
 const QNAN = typemax(UInt16)
+const YIELD_GRAY = RGBf(0.62, 0.62, 0.62)     # von Mises stress at or above the yield stress of the part
+const YIELD_TOL = 0.995                       # nodal averages of yielded elements sit just below fy
 
 # ---- palettes ------------------------------------------------------------------------------
 
@@ -59,18 +61,21 @@ struct FieldDef
     bot::Symbol           # stored array shown on the −normal face
     auto::Float64         # default contour limit
     plate_only::Bool
+    yield::Bool           # show values at or above the yield stress of the part in gray
 end
 
 """
     VizData(result; max_frames = 40, second_order = false, thickness_scale = 1.0)
 
-Everything the viewer draws, precomputed from a `BasePlateFEA.Result`.
+Everything the viewer draws, precomputed from a `BasePlateFEA.Result`. The charts use every frame of the
+result; if the result was thinned before saving, pass the full curves as `history = (; step, N, M, θ, w)`.
 """
 struct VizData
     x::Matrix{Float32}                 # nn × 3 node coordinates
     pv_node::Vector{Int32}             # value slots: one per (part, node)
     pv_part::Vector{Int32}
     pv_off::Matrix{Float32}            # npv × 3 half-thickness offset vector (+normal)
+    pv_fy::Vector{Float32}             # yield stress of the part of each slot (1f30: elastic)
     sv_pv::Vector{Int32}               # surface vertices → value slot
     sv_side::Vector{Int8}              # +1 top (+normal) face, −1 bottom face
     faces::Vector{NTuple{3,Int32}}     # triangles of surface vertices (1-based)
@@ -90,6 +95,11 @@ struct VizData
     first2::Int                        # index of the last frame of the axial step
     center::Vector{Float64}; size::Float64; default_scale::Float64
     plate_t::Float64
+    master::Int32                      # loaded node at the top of the upright
+    M1::Vector{Float64}                # first-order moment of the load pattern, per frame
+    load_v::Float64; load_m::Float64   # lateral force (+y) and moment about x at the master node per unit M1
+    jack_a::Float64                    # hinge-to-hinge length of the axial actuator of the test rig (0: not drawn)
+    history::@NamedTuple{step::Vector{Int}, N::Vector{Float64}, M::Vector{Float64}, θ::Vector{Float64}, w::Vector{Float64}}   # every computed step, for the charts
 end
 
 function _nice(v)
@@ -99,7 +109,7 @@ function _nice(v)
             f <= 5 ? 5.0 : f <= 6 ? 6.0 : f <= 8 ? 8.0 : 10.0) * e
 end
 
-function VizData(res::BasePlateFEA.Result; max_frames::Int = 40, second_order::Bool = false, thickness_scale::Real = 1.0)
+function VizData(res::BasePlateFEA.Result; max_frames::Int = 40, second_order::Bool = false, thickness_scale::Real = 1.0, history = nothing, actuator_length::Real = 0.0)
     m = res.model.mesh
     nn = size(m.x, 1)
     nf_all = length(res.frames)
@@ -193,30 +203,39 @@ function VizData(res::BasePlateFEA.Result; max_frames::Int = 40, second_order::B
         rng[key] = (lo, hi)
         stored[key] = map(v -> isfinite(v) ? round(UInt16, (v - lo) / (hi - lo) * 65534) : QNAN, A)
     end
+    pv_fy = Float32[(st = BasePlateFEA.part_steel(res.model.inp, Int(p)); isfinite(st.fy) ? st.fy : 1.0f30) for p in pv_part]
+    fyl = filter(<(1.0f29), pv_fy)
+    vmax_(keys...) = isempty(fyl) ? amax(keys...) : Float64(maximum(fyl))     # von Mises scale ends at the yield stress
     amax(keys...) = _nice(maximum(max(abs(rng[k][1]), abs(rng[k][2])) for k in keys))
     fields = [
-        FieldDef(:vm_surf, "von Mises stress, shell surfaces", "ksi", :seq, :vm_top, :vm_bot, amax(:vm_top, :vm_bot), false),
-        FieldDef(:vm_mid, "von Mises stress, mid-surface", "ksi", :seq, :vm_mid, :vm_mid, amax(:vm_mid), false),
-        FieldDef(:vm_top, "von Mises stress, top (+normal) surface", "ksi", :seq, :vm_top, :vm_top, amax(:vm_top), false),
-        FieldDef(:vm_bot, "von Mises stress, bottom (−normal) surface", "ksi", :seq, :vm_bot, :vm_bot, amax(:vm_bot), false),
-        FieldDef(:peeq, "Equivalent plastic strain", "", :seq, :peeq, :peeq, amax(:peeq), false),
-        FieldDef(:contact, "Contact stress on the concrete", "ksi", :seq, :contact, :contact, amax(:contact), true),
-        FieldDef(:sx_surf, "σx, shell surfaces (plate x / along wall)", "ksi", :div, :sx_top, :sx_bot, amax(:sx_top, :sx_bot), false),
-        FieldDef(:sy_surf, "σy, shell surfaces (plate y / vertical)", "ksi", :div, :sy_top, :sy_bot, amax(:sy_top, :sy_bot), false),
-        FieldDef(:sx, "σx, membrane", "ksi", :div, :sx, :sx, amax(:sx), false),
-        FieldDef(:sy, "σy, membrane", "ksi", :div, :sy, :sy, amax(:sy), false),
-        FieldDef(:uz, "Vertical displacement", "in", :div, :uz, :uz, amax(:uz), false),
+        FieldDef(:vm_surf, "von Mises stress, shell surfaces", "ksi", :seq, :vm_top, :vm_bot, vmax_(:vm_top, :vm_bot), false, true),
+        FieldDef(:vm_mid, "von Mises stress, mid-surface", "ksi", :seq, :vm_mid, :vm_mid, vmax_(:vm_mid), false, true),
+        FieldDef(:vm_top, "von Mises stress, top (+normal) surface", "ksi", :seq, :vm_top, :vm_top, vmax_(:vm_top), false, true),
+        FieldDef(:vm_bot, "von Mises stress, bottom (−normal) surface", "ksi", :seq, :vm_bot, :vm_bot, vmax_(:vm_bot), false, true),
+        FieldDef(:peeq, "Equivalent plastic strain", "", :seq, :peeq, :peeq, amax(:peeq), false, false),
+        FieldDef(:contact, "Contact stress on the concrete", "ksi", :seq, :contact, :contact, amax(:contact), true, false),
+        FieldDef(:sx_surf, "σx, shell surfaces (plate x / along wall)", "ksi", :div, :sx_top, :sx_bot, amax(:sx_top, :sx_bot), false, false),
+        FieldDef(:sy_surf, "σy, shell surfaces (plate y / vertical)", "ksi", :div, :sy_top, :sy_bot, amax(:sy_top, :sy_bot), false, false),
+        FieldDef(:sx, "σx, membrane", "ksi", :div, :sx, :sx, amax(:sx), false, false),
+        FieldDef(:sy, "σy, membrane", "ksi", :div, :sy, :sy, amax(:sy), false, false),
+        FieldDef(:uz, "Vertical displacement", "in", :div, :uz, :uz, amax(:uz), false, false),
     ]
     lo = vec(minimum(m.x, dims = 1)); hi = vec(maximum(m.x, dims = 1))
     size_ = maximum(hi - lo)
     umax = maximum(abs, disp)
     default_scale = umax > 0 ? clamp(round(0.04 * size_ / umax; sigdigits = 1), 1.0, 500.0) : 1.0
     i1k = findlast(f -> f.step == 1, frames)
-    return VizData(Float32.(m.x), pv_node, pv_part, pv_off, sv_pv, sv_side, faces, face_part, edges, edge_part, feature, feature_part,
+    hist = history === nothing ? (step = [f.step for f in res.frames], N = [f.N for f in res.frames],
+                                  M = [BasePlateFEA.base_moment(res.model, f; second_order) for f in res.frames],
+                                  θ = [f.θ for f in res.frames], w = [f.w for f in res.frames]) :
+           (step = Int.(history.step), N = Float64.(history.N), M = Float64.(history.M), θ = Float64.(history.θ), w = Float64.(history.w))
+    return VizData(Float32.(m.x), pv_node, pv_part, pv_off, pv_fy, sv_pv, sv_side, faces, face_part, edges, edge_part, feature, feature_part,
                    Int32.(m.bolt_nodes), disp, stored, rng, fields,
                    [f.step for f in frames], [f.N for f in frames], [BasePlateFEA.base_moment(res.model, f; second_order) for f in frames],
                    [f.θ for f in frames], [f.w for f in frames], reduce(hcat, [f.bolt_force for f in frames]),
-                   [maximum(f.contact_stress) for f in frames], i1k, (lo + hi) / 2, size_, default_scale, res.model.inp.geometry.t)
+                   [maximum(f.contact_stress) for f in frames], i1k, (lo + hi) / 2, size_, default_scale, res.model.inp.geometry.t,
+                   Int32(m.master), [f.M for f in frames], 1 / BasePlateFEA.rounded_heights(res.model.inp)[2],
+                   -(1 - BasePlateFEA.rounded_heights(res.model.inp)[1] / BasePlateFEA.rounded_heights(res.model.inp)[2]), Float64(actuator_length), hist)
 end
 
 nframes(v::VizData) = length(v.step)
@@ -235,11 +254,12 @@ function surface_positions(v::VizData, k::Int, scale::Real)
     return out
 end
 
-# band coordinate in [0, 2 NBANDS): sequential fields use the first NBANDS colors, diverging the last
+# band coordinate in [0, 2 NBANDS + 1): sequential fields use the first NBANDS colors, then one gray band
+# (yielded), diverging fields the last NBANDS
 function surface_colors(v::VizData, k::Int, fd::FieldDef, cmax::Real)
     out = Vector{Float32}(undef, length(v.sv_pv))
     lo, hi = fd.kind == :seq ? (0.0, float(cmax)) : (-float(cmax), float(cmax))
-    base = fd.kind == :seq ? 0.0 : float(NBANDS)
+    base = fd.kind == :seq ? 0.0 : float(NBANDS + 1)
     for i in eachindex(v.sv_pv)
         key = v.sv_side[i] > 0 ? fd.top : fd.bot
         q = v.stored[key][v.sv_pv[i], k]
@@ -248,7 +268,8 @@ function surface_colors(v::VizData, k::Int, fd::FieldDef, cmax::Real)
         else
             r = v.range[key]
             val = r[1] + q / 65534 * (r[2] - r[1])
-            out[i] = base + NBANDS * clamp((val - lo) / (hi - lo), 0.0, 1 - 1e-6)
+            out[i] = fd.yield && val >= YIELD_TOL * v.pv_fy[v.sv_pv[i]] ? NBANDS + 0.5f0 :
+                     base + NBANDS * clamp((val - lo) / (hi - lo), 0.0, 1 - 1e-6)
         end
     end
     return out
@@ -260,7 +281,72 @@ function bolt_positions(v::VizData, k::Int, scale::Real)
                     v.x[n, 3] + scale * v.disp[3, n, k] + v.plate_t / 2) for n in v.bolt_nodes]
 end
 
-band_colormap(palette) = cgrad(vcat(sequential_bands(palette), diverging_bands(palette)), 2NBANDS; categorical = true)
+# ---- force vectors: line segments with a fixed number of points (the JavaScript mirrors this) ----
+const ARC_N = 18
+function _arrow!(out, tail, tip, a, b, show)
+    show || (append!(out, fill(Point3f(tip), 10)); return out)
+    d = tip - tail; len = sqrt(sum(abs2, d)); hl = 0.28f0 * len; u = d / len
+    push!(out, Point3f(tail), Point3f(tip))
+    for w in (a, -a, b, -b)
+        push!(out, Point3f(tip), Point3f(tip - hl * u + 0.35f0 * hl * w))
+    end
+    return out
+end
+load_ref(v::VizData) = max(maximum(abs, v.N), 1e-9)
+lateral_ref(v::VizData) = max(maximum(abs, v.load_v .* v.M1), 1e-9)
+bolt_ref(v::VizData) = max(maximum(v.bolt), 1e-9)
+"segments of the test loads: axial jack force F1, lateral jack force F2, and (when the upright is modelled\nshorter than the F2 lever arm) the moment that moves F2 down to the top of the model"
+function load_segments(v::VizData, k::Int, scale::Real)
+    n = v.master; L = 0.2f0 * Float32(v.size); ex = Vec3f(1, 0, 0); ey = Vec3f(0, 1, 0); ez = Vec3f(0, 0, 1)
+    pm = Vec3f(v.x[n, 1] + scale * v.disp[1, n, k], v.x[n, 2] + scale * v.disp[2, n, k], v.x[n, 3] + scale * v.disp[3, n, k])
+    out = Point3f[]
+    N = v.N[k]; V = v.load_v * v.M1[k]; Mt = v.load_m * v.M1[k]; ref = load_ref(v)
+    dir = ez                                                                          # line of action of the axial force
+    if has_actuator(v)   # the jack forces of the test: F1 along the actuator, F2 the rest of the lateral force
+        β = actuator_angle(v, k); V -= N * tan(β); N /= cos(β)
+        d = Vec3f(v.x[n, 1], v.x[n, 2], v.x[n, 3] + v.jack_a) - pm; dir = d / sqrt(sum(abs2, d))
+    end
+    ln = L * Float32(abs(N) / ref)
+    _arrow!(out, pm + ln * dir, pm, ex, ey, abs(N) > 1e-9 * ref)                      # compression: pointing onto the top
+    lv = 0.6f0 * L * Float32(abs(V) / lateral_ref(v)); sg = V >= 0 ? 1.0f0 : -1.0f0
+    _arrow!(out, pm - sg * lv * ey, pm, ex, ez, abs(V) > 1e-9 * ref)
+    R = 0.07f0 * Float32(v.size); show = abs(Mt) > 1e-9 * ref; sm = Mt >= 0 ? 1.0f0 : -1.0f0
+    arc(i) = (φ = sm * (0.5f0 + 4.7f0 * i / ARC_N); pm + R * (cos(φ) * ey + sin(φ) * ez))
+    for i in 0:ARC_N-1
+        append!(out, show ? (Point3f(arc(i)), Point3f(arc(i + 1))) : (Point3f(pm), Point3f(pm)))
+    end
+    φe = sm * 5.2f0; tip = arc(ARC_N); t = sm * (-sin(φe) * ey + cos(φe) * ez); r = cos(φe) * ey + sin(φe) * ez; hl = 0.45f0 * R
+    for w in (r, -r)
+        append!(out, show ? (Point3f(tip), Point3f(tip - hl * t + 0.4f0 * hl * w)) : (Point3f(pm), Point3f(pm)))
+    end
+    return out
+end
+has_actuator(v::VizData) = v.jack_a > 0 && abs(v.load_m) < 1e-9   # only when the upright is modelled up to the load point
+"tilt β of the axial actuator (rad, signed with the lateral displacement of the load point) for frame `k`"
+actuator_angle(v::VizData, k::Int) = atan(v.disp[2, v.master, k], v.jack_a - v.disp[3, v.master, k])
+"""
+axial actuator of the test rig: hinged on the loaded end of the upright and on a fixed point `jack_a` above its
+undeformed position. 12 points: actuator, vertical reference line, a cross at each hinge.
+"""
+function actuator_segments(v::VizData, k::Int, scale::Real)
+    n = v.master; h = 0.03f0 * Float32(v.size); a = Float32(v.jack_a)
+    p0 = Vec3f(v.x[n, 1], v.x[n, 2], v.x[n, 3]); top = p0 + a * Vec3f(0, 0, 1)
+    pm = Vec3f(v.x[n, 1] + scale * v.disp[1, n, k], v.x[n, 2] + scale * v.disp[2, n, k], v.x[n, 3] + scale * v.disp[3, n, k])
+    ex = Vec3f(1, 0, 0); ey = Vec3f(0, 1, 0)
+    return Point3f[pm, top, p0, top, top - h * ey, top + h * ey, top - h * ex, top + h * ex, pm - h * ey, pm + h * ey, pm - h * ex, pm + h * ex]
+end
+const ACTUATOR_COLORS = vcat(fill(RGBAf(0.05, 0.40, 0.45, 1), 2), fill(RGBAf(0.45, 0.45, 0.45, 0.8), 2), fill(RGBAf(0.05, 0.40, 0.45, 1), 8))
+"bolt force vectors (tension): arrows pointing down onto the bolt heads, length ∝ force"
+function bolt_segments(v::VizData, k::Int, scale::Real)
+    L = 0.14f0 * Float32(v.size); out = Point3f[]; ref = bolt_ref(v)
+    for (i, p) in enumerate(bolt_positions(v, k, scale))
+        F = v.bolt[i, k]; tip = Vec3f(p) + Vec3f(0, 0, 0.2)
+        _arrow!(out, tip + L * Float32(max(F, 0) / ref) * Vec3f(0, 0, 1), tip, Vec3f(1, 0, 0), Vec3f(0, 1, 0), F > 1e-6 * ref)
+    end
+    return out
+end
+
+band_colormap(palette) = cgrad(vcat(sequential_bands(palette), YIELD_GRAY, diverging_bands(palette)), 2NBANDS + 1; categorical = true)
 
 # ---- scene ---------------------------------------------------------------------------------
 
@@ -270,7 +356,7 @@ function draw_model!(ax, v::VizData, k::Int, fd::FieldDef; scale, cmax, palette 
     pos = surface_positions(v, k, scale)
     fsel = upright ? eachindex(v.faces) : findall(==(1), v.face_part)
     faces = [GLTriangleFace(f...) for f in v.faces[fsel]]
-    msh = mesh!(ax, pos, faces; color = surface_colors(v, k, fd, cmax), colormap = band_colormap(palette), colorrange = (0, 2NBANDS),
+    msh = mesh!(ax, pos, faces; color = surface_colors(v, k, fd, cmax), colormap = band_colormap(palette), colorrange = (0, 2NBANDS + 1),
                 nan_color = RGBf(0.80, 0.80, 0.78), shading = true, backlight = 1.0f0, specular = 0.12f0, shininess = 24.0f0,
                 diffuse = 0.55f0, interpolate = false, ssao)
     esel = upright ? eachindex(v.edges) : findall(==(1), v.edge_part)
@@ -283,7 +369,11 @@ function draw_model!(ax, v::VizData, k::Int, fd::FieldDef; scale, cmax, palette 
     R = 0.3f0
     bl = meshscatter!(ax, bolt_positions(v, k, scale); marker = GeometryBasics.Cylinder(Point3f(0, 0, 0), Point3f(0, 0, 1), 1.0f0),
                       markersize = Vec3f(R, R, 0.18), color = RGBf(0.62, 0.64, 0.67), shading = true, specular = 0.3f0, ssao)
-    return (; mesh = msh, edges = ed, feature = ft, ghost = gh, bolts = bl)
+    lo = linesegments!(ax, load_segments(v, k, scale); color = RGBf(0.75, 0.05, 0.55), linewidth = 3.0, overdraw = true)
+    bf = linesegments!(ax, bolt_segments(v, k, scale); color = RGBf(0.05, 0.05, 0.05), linewidth = 3.0, overdraw = true)
+    ac = linesegments!(ax, has_actuator(v) ? actuator_segments(v, k, scale) : fill(Point3f(v.center...), 12); color = ACTUATOR_COLORS,
+                       linewidth = 3.0, visible = has_actuator(v))
+    return (; mesh = msh, edges = ed, feature = ft, ghost = gh, bolts = bl, loads = lo, bolt_forces = bf, actuator = ac)
 end
 
 function set_camera!(lscene, v::VizData; azimuth = -0.95, elevation = 0.42, zoom = 1.0)
@@ -309,15 +399,14 @@ function charts!(gl, v::VizData, k::Int; curves = [])
     for c in curves
         String(c.kind) == "reference" && lines!(a1, c.θ, c.M; color = s2, linewidth = 1.6, linestyle = :dash, label = c.label)
     end
-    r2 = v.first2:nframes(v)
-    lines!(a1, v.θ[r2], v.M[r2]; color = s1, linewidth = 2.2, label = "Model")
+    h = v.history; h1 = findlast(==(1), h.step); r1 = 1:h1; r2 = h1:length(h.step)
+    lines!(a1, h.θ[r2], h.M[r2]; color = s1, linewidth = 2.2, label = "Model")
     any(c -> String(c.kind) == "test", curves) && lines!(a1, [NaN], [NaN]; color = RGBAf(0.35, 0.35, 0.33, 0.8), linewidth = 1.0, label = "Tests")
     m1 = scatter!(a1, [Point2f(v.θ[k], v.M[k])]; color = s1, strokecolor = :white, strokewidth = 2, markersize = 13)
     isempty(curves) || axislegend(a1; position = :rb, framevisible = false, labelsize = 11, patchsize = (18, 10), rowgap = 0, padding = (4, 4, 2, 2))
     a2 = Axis(gl[2, 1]; title = "Axial force – shortening", xlabel = "Shortening at the rotation gauges (in)", ylabel = "Axial force (kip)", kw...)
-    r1 = 1:v.first2
-    lines!(a2, -v.w[r1], v.N[r1]; color = s1, linewidth = 2.2)
-    lines!(a2, -v.w[r2], v.N[r2]; color = s1, linewidth = 1.2, linestyle = :dot)
+    lines!(a2, -h.w[r1], h.N[r1]; color = s1, linewidth = 2.2)
+    lines!(a2, -h.w[r2], h.N[r2]; color = s1, linewidth = 1.2, linestyle = :dot)
     m2 = scatter!(a2, [Point2f(-v.w[k], v.N[k])]; color = s1, strokecolor = :white, strokewidth = 2, markersize = 13)
     return m1, m2
 end
@@ -351,7 +440,7 @@ function render_image(path::AbstractString, v::VizData, frame::Int = nframes(v);
     ticks = collect(range(lo, cm; length = NBANDS + 1))
     Colorbar(fig[1, 2]; colormap = cgrad(bands, NBANDS; categorical = true), limits = (lo, cm), ticks = (ticks, fmt.(ticks)),
              label = isempty(fd.unit) ? fd.label : "$(fd.label) ($(fd.unit))", width = 22, ticklabelsize = 13, labelsize = 14,
-             height = Relative(0.6), tellheight = false)
+             height = Relative(0.6), tellheight = false, (fd.yield ? (; highclip = YIELD_GRAY) : (;))...)
     info = @sprintf("N = %.2f kip    M = %.2f kip-in    θ = %.4f rad    deformation ×%s", v.N[frame], v.M[frame], v.θ[frame], fmt(scale))
     Label(fig[0, 1:2], isempty(title) ? info : title * "\n" * info; halign = :left, fontsize = 15, justification = :left)
     if charts
@@ -426,7 +515,7 @@ function viewer_app(v::VizData; title::AbstractString = "Base plate model", subt
         tohex(c) = "#" * hex(RGB{Colors.N0f8}(clamp(c.r, 0, 1), clamp(c.g, 0, 1), clamp(c.b, 0, 1)))
         data = Dict(
             "nn" => nn, "npv" => npv, "nf" => nframes(v), "nbands" => NBANDS,
-            "x" => vec(permutedims(v.x)), "pv_node" => _i32(v.pv_node .- 1), "pv_off" => vec(permutedims(v.pv_off)),
+            "x" => vec(permutedims(v.x)), "pv_node" => _i32(v.pv_node .- 1), "pv_off" => vec(permutedims(v.pv_off)), "pv_fy" => v.pv_fy, "yield_tol" => YIELD_TOL, "gray" => tohex(YIELD_GRAY),
             "sv_pv" => _i32(v.sv_pv .- 1), "sv_side" => Int8.(v.sv_side),
             "faces" => UInt32[UInt32(i - 1) for f in v.faces for i in f], "face_part" => _i32(v.face_part),
             "edges" => UInt32[UInt32(i - 1) for e in v.edges for i in e], "edge_part" => _i32(v.edge_part),
@@ -436,10 +525,12 @@ function viewer_app(v::VizData; title::AbstractString = "Base plate model", subt
             "stored" => Dict(String(k) => _u16(a) for (k, a) in v.stored),
             "range" => Dict(String(k) => [r[1], r[2]] for (k, r) in v.range),
             "fields" => [Dict("key" => String(f.key), "label" => f.label, "unit" => f.unit, "kind" => String(f.kind), "top" => String(f.top),
-                              "bot" => String(f.bot), "auto" => f.auto, "plate_only" => f.plate_only) for f in v.fields],
+                              "bot" => String(f.bot), "auto" => f.auto, "plate_only" => f.plate_only, "yield" => f.yield) for f in v.fields],
             "seq" => tohex.(sequential_bands(palette)), "div" => tohex.(diverging_bands(palette)),
             "step" => v.step, "N" => v.N, "M" => v.M, "theta" => v.θ, "w" => v.w, "bolt" => vec(v.bolt), "nbolt" => Base.size(v.bolt, 1),
-            "contact_max" => v.contact_max, "default_scale" => v.default_scale,
+            "contact_max" => v.contact_max, "master" => Int(v.master) - 1, "M1" => v.M1, "load_v" => v.load_v, "load_m" => v.load_m,
+            "load_ref" => load_ref(v), "bolt_ref" => bolt_ref(v), "lat_ref" => lateral_ref(v), "size" => v.size, "arc_n" => ARC_N, "default_scale" => v.default_scale,
+            "jack_a" => (has_actuator(v) ? v.jack_a : 0.0), "jack_given" => v.jack_a,
             "frame0" => frame - 1, "field0" => String(field),
         )
 
@@ -453,13 +544,15 @@ function viewer_app(v::VizData; title::AbstractString = "Base plate model", subt
         cb(lbl, checked) = (i = DOM.input(; type = "checkbox", checked...); (i, DOM.label(i, lbl)))
         c_up, l_up = cb("Upright", (; checked = true)); c_ed, l_ed = cb("Mesh edges", (; checked = true))
         c_gh, l_gh = cb("Undeformed outline", (;)); c_bo, l_bo = cb("Bolts", (; checked = true))
+        c_fv, l_fv = cb("Force vectors", (; checked = true))
+        c_ac, l_ac = cb("Actuator", (; checked = true))
         legend = DOM.div(; class = "legend"); info = DOM.div(; class = "info")
 
         code = js"""
         (() => {
         const D = $(data);
         const el = {sel: $(sel), slider: $(slider), play: $(play), steplab: $(steplab), scale: $(scale), cmax: $(cmax), auto: $(auto),
-                    up: $(c_up), ed: $(c_ed), gh: $(c_gh), bo: $(c_bo), legend: $(legend), info: $(info)};
+                    up: $(c_up), ed: $(c_ed), gh: $(c_gh), bo: $(c_bo), fv: $(c_fv), ac: $(c_ac), legend: $(legend), info: $(info)};
         const fieldByKey = {}; D.fields.forEach(f => fieldByKey[f.key] = f);
         el.sel.value = D.field0;
         // optional initial state from the URL hash: #frame=12&field=peeq&scale=10&cmax=60&upright=0&edges=0
@@ -508,7 +601,7 @@ function viewer_app(v::VizData; title::AbstractString = "Base plate model", subt
             }
         }
         function colors(k, f, cmax) {
-            const lo = f.kind === 'seq' ? 0 : -cmax, hi = cmax, base = f.kind === 'seq' ? 0 : NB;
+            const lo = f.kind === 'seq' ? 0 : -cmax, hi = cmax, base = f.kind === 'seq' ? 0 : NB + 1;
             const top = D.stored[f.top], bot = D.stored[f.bot], rt = D.range[f.top], rb = D.range[f.bot], o = k * D.npv;
             let vmax = -Infinity, vmin = Infinity;
             for (let i = 0; i < nsv; i++) {
@@ -516,9 +609,64 @@ function viewer_app(v::VizData; title::AbstractString = "Base plate model", subt
                 if (q === 65535) { col[i] = NaN; continue; }
                 const r = t ? rt : rb, val = r[0] + q / 65534 * (r[1] - r[0]);
                 if (val > vmax) vmax = val; if (val < vmin) vmin = val;
-                col[i] = base + NB * Math.max(0, Math.min(1 - 1e-6, (val - lo) / (hi - lo)));
+                col[i] = (f.yield && val >= D.yield_tol * D.pv_fy[D.sv_pv[i]]) ? NB + 0.5 : base + NB * Math.max(0, Math.min(1 - 1e-6, (val - lo) / (hi - lo)));
             }
             return [vmin, vmax];
+        }
+        function arrow(out, tail, tip, a, b, show) {
+            if (!show) { for (let i = 0; i < 10; i++) out.push(tip[0], tip[1], tip[2]); return; }
+            const d = [tip[0]-tail[0], tip[1]-tail[1], tip[2]-tail[2]], len = Math.hypot(d[0], d[1], d[2]), hl = 0.28 * len;
+            out.push(tail[0], tail[1], tail[2], tip[0], tip[1], tip[2]);
+            for (const [w, sg] of [[a, 1], [a, -1], [b, 1], [b, -1]]) {
+                out.push(tip[0], tip[1], tip[2]);
+                for (let j = 0; j < 3; j++) out.push(tip[j] - hl * d[j] / len + 0.35 * hl * sg * w[j]);
+            }
+        }
+        function loadSegments(k, s) {
+            const n = D.master, o = k * D.nn * 3, L = 0.2 * D.size, out = [];
+            const pm = [D.x[3*n] + s * D.disp[o+3*n], D.x[3*n+1] + s * D.disp[o+3*n+1], D.x[3*n+2] + s * D.disp[o+3*n+2]];
+            let N = D.N[k], V = D.load_v * D.M1[k], dir = [0, 0, 1];
+            const Mt = D.load_m * D.M1[k], ref = D.load_ref;
+            if (D.jack_a > 0) {   // the jack forces of the test: F1 along the actuator, F2 the rest of the lateral force
+                const beta = Math.atan2(D.disp[o+3*n+1], D.jack_a - D.disp[o+3*n+2]); V -= N * Math.tan(beta); N /= Math.cos(beta);
+                const d = [D.x[3*n] - pm[0], D.x[3*n+1] - pm[1], D.x[3*n+2] + D.jack_a - pm[2]], dl = Math.hypot(d[0], d[1], d[2]);
+                dir = [d[0] / dl, d[1] / dl, d[2] / dl];
+            }
+            const ln = L * Math.abs(N) / ref;
+            arrow(out, [pm[0] + ln * dir[0], pm[1] + ln * dir[1], pm[2] + ln * dir[2]], pm, [1,0,0], [0,1,0], Math.abs(N) > 1e-9 * ref);
+            const lv = 0.6 * L * Math.abs(V) / D.lat_ref, sg = V >= 0 ? 1 : -1;
+            arrow(out, [pm[0], pm[1] - sg * lv, pm[2]], pm, [1,0,0], [0,0,1], Math.abs(V) > 1e-9 * ref);
+            const R = 0.07 * D.size, show = Math.abs(Mt) > 1e-9 * ref, sm = Mt >= 0 ? 1 : -1, AN = D.arc_n;
+            const arc = (i) => { const ph = sm * (0.5 + 4.7 * i / AN); return [pm[0], pm[1] + R * Math.cos(ph), pm[2] + R * Math.sin(ph)]; };
+            for (let i = 0; i < AN; i++) { const a = show ? arc(i) : pm, b = show ? arc(i + 1) : pm; out.push(a[0], a[1], a[2], b[0], b[1], b[2]); }
+            const pe = sm * 5.2, tip = arc(AN), t = [0, -sm * Math.sin(pe), sm * Math.cos(pe)], r = [0, Math.cos(pe), Math.sin(pe)], hl = 0.45 * R;
+            for (const w of [1, -1]) {
+                if (!show) { out.push(pm[0], pm[1], pm[2], pm[0], pm[1], pm[2]); continue; }
+                out.push(tip[0], tip[1], tip[2]);
+                for (let j = 0; j < 3; j++) out.push(tip[j] - hl * t[j] + 0.4 * hl * w * r[j]);
+            }
+            return new Float32Array(out);
+        }
+        function actuatorSegments(k, s) {
+            const n = D.master, o = k * D.nn * 3, h = 0.03 * D.size, a = D.jack_a;
+            const p0 = [D.x[3*n], D.x[3*n+1], D.x[3*n+2]], t = [p0[0], p0[1], p0[2] + a];
+            const pm = [p0[0] + s * D.disp[o+3*n], p0[1] + s * D.disp[o+3*n+1], p0[2] + s * D.disp[o+3*n+2]];
+            return new Float32Array([pm[0], pm[1], pm[2], t[0], t[1], t[2], p0[0], p0[1], p0[2], t[0], t[1], t[2],
+                t[0], t[1] - h, t[2], t[0], t[1] + h, t[2], t[0] - h, t[1], t[2], t[0] + h, t[1], t[2],
+                pm[0], pm[1] - h, pm[2], pm[0], pm[1] + h, pm[2], pm[0] - h, pm[1], pm[2], pm[0] + h, pm[1], pm[2]]);
+        }
+        function jack(k) {   // jack forces of the test, F2 positive in the direction of the lateral displacement
+            const n = D.master, o = k * D.nn * 3, d1 = D.disp[o+3*n+1], beta = Math.atan2(d1, D.jack_a - D.disp[o+3*n+2]);
+            return {beta: beta, F1: D.N[k] / Math.cos(beta), F2: (d1 < 0 ? -1 : 1) * (D.load_v * D.M1[k] - D.N[k] * Math.tan(beta))};
+        }
+        function boltSegments(k, s) {
+            const o = k * D.nn * 3, L = 0.14 * D.size, out = [];
+            D.bolt_nodes.forEach((n, i) => {
+                const F = D.bolt[k * D.nbolt + i];
+                const tip = [D.x[3*n] + s * D.disp[o+3*n], D.x[3*n+1] + s * D.disp[o+3*n+1], D.x[3*n+2] + s * D.disp[o+3*n+2] + D.plate_t / 2 + 0.2];
+                arrow(out, [tip[0], tip[1], tip[2] + L * Math.max(F, 0) / D.bolt_ref], tip, [1,0,0], [0,1,0], F > 1e-6 * D.bolt_ref);
+            });
+            return new Float32Array(out);
         }
         function segments(idx) {
             const out = new Float32Array(idx.length * 3);
@@ -528,6 +676,10 @@ function viewer_app(v::VizData; title::AbstractString = "Base plate model", subt
         function legend(f, cmax, ext) {
             const cols = f.kind === 'seq' ? D.seq : D.div, lo = f.kind === 'seq' ? 0 : -cmax;
             let h = '<div class="ttl">' + f.label + (f.unit ? ' (' + f.unit + ')' : '') + '</div>';
+            if (f.yield) {
+                const fys = Array.from(new Set(Array.from(D.pv_fy).filter(x => x < 1e29).map(x => fmt(x))));
+                if (fys.length) h += '<div class="row" style="margin-bottom:12px"><div class="sw" style="border-top-width:1px;background:' + D.gray + '"></div><div class="lab" style="transform:none">yielded (≥ ' + fys.join(' / ') + ')</div></div>';
+            }
             for (let b = NB - 1; b >= 0; b--)
                 h += '<div class="row"><div class="sw" style="background:' + cols[b] + '"></div><div class="lab">' + fmt(lo + (b + 1) * (cmax - lo) / NB) + '</div></div>';
             h += '<div class="row last"><div style="width:30px"></div><div class="lab">' + fmt(lo) + '</div></div>';
@@ -535,9 +687,9 @@ function viewer_app(v::VizData; title::AbstractString = "Base plate model", subt
             el.legend.innerHTML = h;
         }
 
-        Promise.all([$(p.mesh), $(p.edges), $(p.feature), $(p.ghost), $(p.bolts), $(m1), $(m2)]).then(([pm, pe, pf, pg, pb, pk1, pk2]) => {
+        Promise.all([$(p.mesh), $(p.edges), $(p.feature), $(p.ghost), $(p.bolts), $(m1), $(m2), $(p.loads), $(p.bolt_forces), $(p.actuator)]).then(([pm, pe, pf, pg, pb, pk1, pk2, pl, pbf, pac]) => {
             const po = (a) => a[0].plot_object || a[0];   // find_plots returns the three.js objects
-            const mesh = po(pm), edges = po(pe), feature = po(pf), ghost = po(pg), bolts = po(pb), mk1 = po(pk1), mk2 = po(pk2);
+            const mesh = po(pm), edges = po(pe), feature = po(pf), ghost = po(pg), bolts = po(pb), mk1 = po(pk1), mk2 = po(pk2), loads = po(pl), bforce = po(pbf), actuator = po(pac);
             const setbuf = (plot, names, arr) => {   // update the first attribute that exists
                 const g = plot.mesh.geometry, key = names.find(n => (n in g.attributes) || (g.interleaved_attributes && n in g.interleaved_attributes));
                 if (key) plot.update([[key, arr]]); else console.warn('BasePlateViewer: none of', names, 'in', Object.keys(g.attributes));
@@ -565,14 +717,44 @@ function viewer_app(v::VizData; title::AbstractString = "Base plate model", subt
                                                  bp[3*i+2] = D.x[3*n+2] + s * D.disp[o+3*n+2] + D.plate_t / 2; });
                 setbuf(bolts, ['positions_transformed_f32c', 'offset'], bp);
                 bolts.update([['visible', el.bo.checked]]);
+                loads.update([['positions_transformed_f32c', loadSegments(k, s)], ['visible', el.fv.checked && up]]);
+                bforce.update([['positions_transformed_f32c', boltSegments(k, s)], ['visible', el.fv.checked]]);
+                const showAc = D.jack_a > 0 && el.ac.checked && up;
+                if (D.jack_a > 0) actuator.update([['positions_transformed_f32c', actuatorSegments(k, s)], ['visible', showAc]]);
                 setbuf(mk1, ['wgl_positions', 'positions_transformed_f32c'], new Float32Array([D.theta[k], D.M[k]]));
                 setbuf(mk2, ['wgl_positions', 'positions_transformed_f32c'], new Float32Array([-D.w[k], D.N[k]]));
                 legend(f, cmax, ext);
+                if (el.fv.checked) {
+                    const ht = 1 / D.load_v, mt = D.load_m * D.M1[k];
+                    let fh = '<div class="note" style="margin-top:16px;color:#0b0b0b"><b>Force vectors</b></div>';
+                    if (D.jack_a > 0) {
+                        const jf = jack(k);
+                        fh += '<div class="note" style="margin-top:4px"><span style="color:#bf0d8c">━</span> F1, along the actuator: ' + jf.F1.toFixed(3) + ' kip = N / cos β, ' + (100 * (1 / Math.cos(jf.beta) - 1)).toFixed(3) + '% above the axial load N = F1 cos β = ' + D.N[k].toFixed(3) + ' kip</div>' +
+                            '<div class="note" style="margin-top:2px"><span style="color:#bf0d8c">━</span> F2, lateral jack: ' + fmt(jf.F2) + ' kip, acting ' + fmt(ht) + ' in above the plate (total lateral force F2 + F1 sin β: ' + fmt(D.load_v * D.M1[k]) + ' kip)</div>';
+                    } else fh += '<div class="note" style="margin-top:4px"><span style="color:#bf0d8c">━</span> axial component of F1 (F1 cos β): ' + fmt(D.N[k]) + ' kip</div>' +
+                        '<div class="note" style="margin-top:2px"><span style="color:#bf0d8c">━</span> total lateral force (F2 + F1 sin β): ' + fmt(D.load_v * D.M1[k]) + ' kip' + (ht < 1e6 ? ', acting ' + fmt(ht) + ' in above the plate' : '') + '</div>';
+                    if (Math.abs(D.load_m) > 1e-9) fh += '<div class="note" style="margin-top:2px"><span style="color:#bf0d8c">⟳</span> ' + fmt(Math.abs(mt)) + ' kip-in: lateral force moved down to the top of the modelled upright</div>';
+                    for (let i = 0; i < D.nbolt; i++) fh += '<div class="note" style="margin-top:2px"><span style="color:#0b0b0b">━</span> bolt ' + (i + 1) + ' tension: ' + (D.bolt[k * D.nbolt + i] > 1e-6 * D.bolt_ref ? fmt(D.bolt[k * D.nbolt + i]) + ' kip' : '0 (not engaged)') + '</div>';
+                    fh += '<div class="note" style="margin-top:4px">arrow length ∝ force, with a separate scale for the axial force, the lateral force and the bolts; F1 is drawn along the actuator</div>';
+                    el.legend.innerHTML += fh;
+                }
+                if (el.ac.checked) {
+                    let ah = '<div class="note" style="margin-top:16px;color:#0b0b0b"><b>Axial actuator (F1 jack)</b></div>';
+                    if (D.jack_a > 0) {
+                        const n = D.master, o = k * D.nn * 3, d1 = D.disp[o+3*n+1], dz = D.disp[o+3*n+2];
+                        const beta = Math.atan2(d1, D.jack_a - dz);
+                        ah += '<div class="note" style="margin-top:4px"><span style="color:#0d6673">━</span> hinged at both ends, a = ' + fmt(D.jack_a) + ' in (' + (D.jack_a * 25.4).toFixed(0) + ' mm) between hinges; grey line: its position before loading</div>' +
+                            '<div class="note" style="margin-top:2px">lateral displacement of the load point δ1: ' + fmt(Math.abs(d1)) + ' in</div>' +
+                            '<div class="note" style="margin-top:2px">tilt β = arctan(δ1 / a): ' + (Math.abs(beta) * 180 / Math.PI).toFixed(2) + '°</div>' +
+                            (Math.abs(s - 1) > 1e-9 ? '<div class="note" style="margin-top:4px">drawn with deformation × ' + fmt(s) + ', so the drawn tilt is not β</div>' : '');
+                    } else ah += '<div class="note" style="margin-top:4px">' + (D.jack_given > 0 ? 'not drawn: the load point is above the modelled upright' : 'no actuator length given for this model') + '</div>';
+                    el.legend.innerHTML += ah;
+                }
                 el.steplab.textContent = 'Step ' + k + ' / ' + (D.nf - 1);
                 let b = '';
                 for (let i = 0; i < D.nbolt; i++) b += (i ? ', ' : '') + fmt(D.bolt[k * D.nbolt + i]);
                 el.info.innerHTML = (D.step[k] === 1 ? 'Axial step' : 'Moment step') + ' &nbsp; <b>N</b> ' + fmt(D.N[k]) + ' kip &nbsp; <b>M</b> ' + fmt(D.M[k]) +
-                    ' kip-in &nbsp; <b>θ</b> ' + D.theta[k].toFixed(5) + ' rad &nbsp; <b>bolt forces</b> ' + b + ' kip &nbsp; <b>max contact</b> ' + fmt(D.contact_max[k]) + ' ksi';
+                    ' kip-in &nbsp; <b>θ</b> ' + D.theta[k].toFixed(5) + ' rad &nbsp; ' + (D.jack_a > 0 ? '<b>F1</b> ' + jack(k).F1.toFixed(3) + ' kip &nbsp; <b>F2</b> ' + fmt(jack(k).F2) + ' kip' : '<b>axial</b> ' + fmt(D.N[k]) + ' kip &nbsp; <b>lateral</b> ' + fmt(D.load_v * D.M1[k]) + ' kip') + ' &nbsp; <b>bolt tension</b> ' + b + ' kip &nbsp; <b>max contact</b> ' + fmt(D.contact_max[k]) + ' ksi';
                 window.__bpv_rendered = (window.__bpv_rendered || 0) + 1;
             }
             let timer = null;
@@ -586,7 +768,7 @@ function viewer_app(v::VizData; title::AbstractString = "Base plate model", subt
             el.slider.oninput = render; el.scale.oninput = render; el.cmax.oninput = render;
             el.sel.onchange = () => { el.cmax.value = num(fieldByKey[el.sel.value].auto); render(); };
             el.auto.onclick = () => { el.cmax.value = num(fieldByKey[el.sel.value].auto); render(); };
-            [el.up, el.ed, el.gh, el.bo].forEach(c => c.onchange = render);
+            [el.up, el.ed, el.gh, el.bo, el.fv, el.ac].forEach(c => c.onchange = render);
             render();
         }).catch(e => console.error('BasePlateViewer:', e));
         })();
@@ -595,7 +777,7 @@ function viewer_app(v::VizData; title::AbstractString = "Base plate model", subt
         return DOM.div(DOM.style(CSS),
             DOM.h1(title), DOM.div(subtitle; class = "sub"),
             DOM.div(DOM.label("Contour ", sel), DOM.label("max ", cmax, auto), DOM.label(play, slider, steplab; class = "step"),
-                    DOM.label("Deformation × ", scale), l_up, l_ed, l_gh, l_bo; class = "bar"),
+                    DOM.label("Deformation × ", scale), l_up, l_ed, l_gh, l_bo, l_fv, l_ac; class = "bar"),
             DOM.div(DOM.div(legend; class = "left"), DOM.div(fig, info; class = "right"); class = "wrap"); class = "bpv")
     end
 end
